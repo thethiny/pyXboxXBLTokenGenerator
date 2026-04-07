@@ -1,0 +1,12 @@
+# cache
+__pycache__/
+*.pyc
+.env
+.pytest_cache
+settings.json
+
+# Test
+test_scripts
+
+# App
+tokens.json
