@@ -6,19 +6,19 @@ No external Xbox libraries needed — only httpx and cryptography.
 
 Multi-stage API (for backends/Flask):
     client = XboxAuthClient()
-    url, state = await client.start_auth()          # → redirect user to url
-    await client.finish_auth(authorization_code)     # → user returns with code
-    header = await client.get_xbl3_header("rp://api.wbagora.com/")
+    auth_start = client.start_auth()                 # → redirect user to auth_start.auth_url
+    client.finish_auth(authorization_code, auth_start)  # → user returns with code
+    header = client.get_xbl3_header("rp://api.wbagora.com/")
 
 Interactive helper (opens browser, handles callback):
     client = XboxAuthClient()
-    await client.authenticate_interactive()
-    header = await client.get_xbl3_header("rp://api.wbagora.com/")
+    client.authenticate_interactive()
+    header = client.get_xbl3_header("rp://api.wbagora.com/")
 
 Token refresh (no user interaction):
     client = XboxAuthClient()
-    await client.refresh(refresh_token)
-    header = await client.get_xbl3_header("rp://api.wbagora.com/")
+    new_rt = client.refresh(refresh_token)
+    header = client.get_xbl3_header("rp://api.wbagora.com/")
 """
 
 import base64
@@ -52,9 +52,9 @@ class AuthMethod(str, Enum):
 class AuthStartResult:
     """Returned by start_auth(). Contains everything needed to resume the flow."""
     auth_url: str
-    state: str                         # opaque state to pass back in finish_auth
-    redirect_uri: str                  # where the user will be sent after login
-    _internal: dict                    # internal flow state (code_verifier, device_token, etc.)
+    state: str
+    redirect_uri: str
+    _internal: dict
 
 
 # ============================================================
@@ -87,7 +87,7 @@ class _ProofKey:
         header = struct.pack(">I", 1) + struct.pack(">Q", filetime) + r.to_bytes(32, "big") + s.to_bytes(32, "big")
         return base64.b64encode(header).decode()
 
-    def _signed_headers(self, url: str, body: str) -> dict:
+    def signed_headers(self, url: str, body: str) -> dict:
         return {
             "Signature": self.sign("POST", url, body),
             "Content-Type": "application/json",
@@ -101,13 +101,13 @@ class _ProofKey:
 
 class XboxAuthClient:
     """
-    Xbox Live authentication client.
+    Xbox Live authentication client (synchronous).
 
     Args:
         method: AuthMethod.STANDARD (default) or AuthMethod.SISU
         token_file: Path to cache refresh tokens (None to disable)
         port: Localhost port for interactive Standard OAuth callback
-        client_id: Override the default OpenXbox client ID (Standard only)
+        client_id: Override the default Azure AD client ID (Standard only)
     """
 
     _STD_CLIENT_ID = "388ea51c-0b25-4029-aae2-17df49d23905"
@@ -148,44 +148,40 @@ class XboxAuthClient:
     # Multi-stage API (no browser, no I/O)
     # ============================================================
 
-    async def start_auth(self, redirect_uri: Optional[str] = None) -> AuthStartResult:
+    def start_auth(self, redirect_uri: Optional[str] = None) -> AuthStartResult:
         """
         Stage 1: Start the auth flow.
         Returns an AuthStartResult with the URL to send the user to.
-
-        For Standard: redirect_uri defaults to http://localhost:{port}/auth/callback
-        For Sisu: redirect_uri is always ms-xal-{app}://auth (cannot be changed)
         """
         if self.method == AuthMethod.STANDARD:
             return self._start_standard(redirect_uri)
         else:
-            return await self._start_sisu()
+            return self._start_sisu()
 
-    async def finish_auth(self, authorization_code: str, auth_start: AuthStartResult) -> None:
+    def finish_auth(self, authorization_code: str, auth_start: AuthStartResult) -> None:
         """
         Stage 2: Complete the auth flow with the authorization code from the callback.
-        After this, get_xbl3_header() and get_xsts_token() are available.
         """
         if self.method == AuthMethod.STANDARD:
-            await self._finish_standard(authorization_code, auth_start)
+            self._finish_standard(authorization_code, auth_start)
         else:
-            await self._finish_sisu(authorization_code, auth_start)
+            self._finish_sisu(authorization_code, auth_start)
 
-    async def refresh(self, refresh_token: str) -> str:
+    def refresh(self, refresh_token: str) -> str:
         """
         Refresh auth using a stored refresh token. No user interaction.
         Returns the new refresh token (save it for next time).
         """
         if self.method == AuthMethod.STANDARD:
-            return await self._refresh_standard(refresh_token)
+            return self._refresh_standard(refresh_token)
         else:
-            return await self._refresh_sisu(refresh_token)
+            return self._refresh_sisu(refresh_token)
 
     # ============================================================
     # Interactive helper (opens browser, handles callback)
     # ============================================================
 
-    async def authenticate_interactive(self) -> None:
+    def authenticate_interactive(self) -> None:
         """
         Convenience method: full auth with browser + localhost callback (Standard)
         or browser + paste-URL (Sisu). Handles token caching automatically.
@@ -196,7 +192,7 @@ class XboxAuthClient:
                 saved = json.loads(self.token_file.read_text())
                 rt = saved.get("refresh_token") or saved.get("sisu_refresh_token")
                 if rt:
-                    new_rt = await self.refresh(rt)
+                    new_rt = self.refresh(rt)
                     self._save_tokens(new_rt)
                     print(f"[+] Refreshed session for {self._gamertag}")
                     return
@@ -204,9 +200,9 @@ class XboxAuthClient:
                 print("[*] Cached tokens expired, logging in...")
 
         # Fresh login
-        auth_start = await self.start_auth()
+        auth_start = self.start_auth()
 
-        print(f"[*] Opening browser for login...")
+        print("[*] Opening browser for login...")
         webbrowser.open(auth_start.auth_url)
 
         if self.method == AuthMethod.STANDARD:
@@ -219,7 +215,7 @@ class XboxAuthClient:
                 raise ValueError(f"No 'code' parameter in URL: {redirect_result}")
             code = params["code"][0]
 
-        await self.finish_auth(code, auth_start)
+        self.finish_auth(code, auth_start)
 
         # Save refresh token
         rt = auth_start._internal.get("refresh_token")
@@ -232,21 +228,19 @@ class XboxAuthClient:
     # Token retrieval (post-auth)
     # ============================================================
 
-    async def get_xbl3_header(self, relying_party: str) -> str:
+    def get_xbl3_header(self, relying_party: str) -> str:
         """Get XBL3.0 authorization header for the given relying party."""
         if not self._user_token:
             raise RuntimeError("Not authenticated. Call start_auth/finish_auth or authenticate_interactive first.")
-        async with httpx.AsyncClient() as client:
-            xsts = await self._request_xsts(client, relying_party, self._user_token)
+        xsts = self._request_xsts(relying_party, self._user_token)
         uhs = xsts["DisplayClaims"]["xui"][0]["uhs"]
         return f"XBL3.0 x={uhs};{xsts['Token']}"
 
-    async def get_xsts_token(self, relying_party: str) -> dict:
+    def get_xsts_token(self, relying_party: str) -> dict:
         """Get raw XSTS response dict for the given relying party."""
         if not self._user_token:
             raise RuntimeError("Not authenticated. Call start_auth/finish_auth or authenticate_interactive first.")
-        async with httpx.AsyncClient() as client:
-            return await self._request_xsts(client, relying_party, self._user_token)
+        return self._request_xsts(relying_party, self._user_token)
 
     # ============================================================
     # Standard OAuth — internals
@@ -270,10 +264,10 @@ class XboxAuthClient:
             _internal={"redirect_uri": redir},
         )
 
-    async def _finish_standard(self, code: str, auth_start: AuthStartResult) -> None:
+    def _finish_standard(self, code: str, auth_start: AuthStartResult) -> None:
         redir = auth_start._internal["redirect_uri"]
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
+        with httpx.Client(timeout=30) as client:
+            resp = client.post(
                 "https://login.microsoftonline.com/consumers/oauth2/v2.0/token",
                 data={
                     "client_id": self._client_id,
@@ -287,12 +281,12 @@ class XboxAuthClient:
             resp.raise_for_status()
             oauth = resp.json()
             auth_start._internal["refresh_token"] = oauth.get("refresh_token")
-            await self._get_xbox_user_token(client, oauth["access_token"], prefix="d")
+            self._get_xbox_user_token(client, oauth["access_token"], prefix="d")
 
-    async def _refresh_standard(self, refresh_token: str) -> str:
+    def _refresh_standard(self, refresh_token: str) -> str:
         redir = f"http://localhost:{self.port}/auth/callback"
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
+        with httpx.Client(timeout=30) as client:
+            resp = client.post(
                 "https://login.microsoftonline.com/consumers/oauth2/v2.0/token",
                 data={
                     "client_id": self._client_id,
@@ -305,15 +299,15 @@ class XboxAuthClient:
             )
             resp.raise_for_status()
             oauth = resp.json()
-            new_rt = oauth.get("refresh_token", refresh_token)
-            await self._get_xbox_user_token(client, oauth["access_token"], prefix="d")
+            new_rt: str = oauth.get("refresh_token", refresh_token)
+            self._get_xbox_user_token(client, oauth["access_token"], prefix="d")
             return new_rt
 
     # ============================================================
     # Sisu/XAL — internals
     # ============================================================
 
-    async def _start_sisu(self) -> AuthStartResult:
+    def _start_sisu(self) -> AuthStartResult:
         self._proof_key = _ProofKey()
         code_verifier = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode()
         code_challenge = base64.urlsafe_b64encode(
@@ -321,8 +315,8 @@ class XboxAuthClient:
         ).rstrip(b"=").decode()
         state = base64.urlsafe_b64encode(secrets.token_bytes(64)).rstrip(b"=").decode()
 
-        async with httpx.AsyncClient(timeout=30) as client:
-            device_token = await self._get_device_token(client)
+        with httpx.Client(timeout=30) as client:
+            device_token = self._get_device_token(client)
 
             url = "https://sisu.xboxlive.com/authenticate"
             body = json.dumps({
@@ -339,7 +333,7 @@ class XboxAuthClient:
                     "state": state,
                 },
             })
-            resp = await client.post(url, content=body, headers=self._proof_key._signed_headers(url, body))
+            resp = client.post(url, content=body, headers=self._proof_key.signed_headers(url, body))
             resp.raise_for_status()
 
         session_id = resp.headers.get("x-sessionid")
@@ -356,11 +350,10 @@ class XboxAuthClient:
             },
         )
 
-    async def _finish_sisu(self, code: str, auth_start: AuthStartResult) -> None:
+    def _finish_sisu(self, code: str, auth_start: AuthStartResult) -> None:
         internal = auth_start._internal
-        async with httpx.AsyncClient(timeout=30) as client:
-            # Exchange code for MSA token
-            resp = await client.post("https://login.live.com/oauth20_token.srf", data={
+        with httpx.Client(timeout=30) as client:
+            resp = client.post("https://login.live.com/oauth20_token.srf", data={
                 "client_id": self._SISU_APP_ID,
                 "code": code,
                 "code_verifier": internal["code_verifier"],
@@ -373,8 +366,7 @@ class XboxAuthClient:
             msa_token = tokens["access_token"]
             internal["refresh_token"] = tokens.get("refresh_token")
 
-            # Sisu authorize
-            sisu = await self._sisu_authorize(
+            sisu = self._sisu_authorize(
                 client, msa_token, internal["device_token"], internal.get("session_id"),
             )
             self._user_token = sisu["UserToken"]["Token"]
@@ -382,11 +374,10 @@ class XboxAuthClient:
             self._gamertag = claims.get("gtg")
             self._xuid = claims.get("xid")
 
-    async def _refresh_sisu(self, refresh_token: str) -> str:
+    def _refresh_sisu(self, refresh_token: str) -> str:
         self._proof_key = _ProofKey()
-        async with httpx.AsyncClient(timeout=30) as client:
-            # Refresh MSA token
-            resp = await client.post("https://login.live.com/oauth20_token.srf", data={
+        with httpx.Client(timeout=30) as client:
+            resp = client.post("https://login.live.com/oauth20_token.srf", data={
                 "client_id": self._SISU_APP_ID,
                 "grant_type": "refresh_token",
                 "refresh_token": refresh_token,
@@ -394,11 +385,11 @@ class XboxAuthClient:
             }, headers={"Content-Type": "application/x-www-form-urlencoded"})
             resp.raise_for_status()
             tokens = resp.json()
-            new_rt = tokens.get("refresh_token", refresh_token)
+            new_rt: str = tokens.get("refresh_token", refresh_token)
             msa_token = tokens["access_token"]
 
-            device_token = await self._get_device_token(client)
-            sisu = await self._sisu_authorize(client, msa_token, device_token)
+            device_token = self._get_device_token(client)
+            sisu = self._sisu_authorize(client, msa_token, device_token)
             self._user_token = sisu["UserToken"]["Token"]
             claims = sisu["AuthorizationToken"]["DisplayClaims"]["xui"][0]
             self._gamertag = claims.get("gtg")
@@ -409,8 +400,8 @@ class XboxAuthClient:
     # Shared helpers
     # ============================================================
 
-    async def _get_xbox_user_token(self, client: httpx.AsyncClient, access_token: str, prefix: str = "d") -> None:
-        resp = await client.post(
+    def _get_xbox_user_token(self, client: httpx.Client, access_token: str, prefix: str = "d") -> None:
+        resp = client.post(
             "https://user.auth.xboxlive.com/user/authenticate",
             json={
                 "Properties": {
@@ -429,12 +420,12 @@ class XboxAuthClient:
         user_token: str = data["Token"]
         self._user_token = user_token
 
-        xsts = await self._request_xsts(client, "http://xboxlive.com", user_token)
+        xsts = self._request_xsts("http://xboxlive.com", user_token, client=client)
         claims = xsts["DisplayClaims"]["xui"][0]
         self._gamertag = claims.get("gtg")
         self._xuid = claims.get("xid")
 
-    async def _get_device_token(self, client: httpx.AsyncClient) -> str:
+    def _get_device_token(self, client: httpx.Client) -> str:
         if not self._proof_key:
             raise RuntimeError("Proof key not initialized")
         url = "https://device.auth.xboxlive.com/device/authenticate"
@@ -447,12 +438,12 @@ class XboxAuthClient:
             },
             "RelyingParty": "http://auth.xboxlive.com", "TokenType": "JWT",
         })
-        resp = await client.post(url, content=body, headers=self._proof_key._signed_headers(url, body))
+        resp = client.post(url, content=body, headers=self._proof_key.signed_headers(url, body))
         resp.raise_for_status()
         return resp.json()["Token"]
 
-    async def _sisu_authorize(
-        self, client: httpx.AsyncClient, msa_token: str,
+    def _sisu_authorize(
+        self, client: httpx.Client, msa_token: str,
         device_token: str, session_id: Optional[str] = None,
     ) -> dict:
         if not self._proof_key:
@@ -465,24 +456,30 @@ class XboxAuthClient:
             "UseModernGamertag": True, "ProofKey": self._proof_key.get_jwk(),
             **({"SessionId": session_id} if session_id else {}),
         })
-        resp = await client.post(url, content=body, headers=self._proof_key._signed_headers(url, body))
+        resp = client.post(url, content=body, headers=self._proof_key.signed_headers(url, body))
         if resp.status_code != 200:
             raise RuntimeError(f"Sisu authorize failed ({resp.status_code}): {resp.text[:300]}")
         return resp.json()
 
-    async def _request_xsts(self, client: httpx.AsyncClient, rp: str, user_token: str) -> dict:
-        resp = await client.post(
-            "https://xsts.auth.xboxlive.com/xsts/authorize",
-            json={
-                "Properties": {"SandboxId": "RETAIL", "UserTokens": [user_token]},
-                "RelyingParty": rp,
-                "TokenType": "JWT",
-            },
-            headers={"Content-Type": "application/json", "x-xbl-contract-version": "1"},
-        )
-        if resp.status_code != 200:
-            raise RuntimeError(f"XSTS failed ({resp.status_code}) RP={rp}: {resp.text[:300]}")
-        return resp.json()
+    def _request_xsts(self, rp: str, user_token: str, client: Optional[httpx.Client] = None) -> dict:
+        def _do(c: httpx.Client) -> dict:
+            resp = c.post(
+                "https://xsts.auth.xboxlive.com/xsts/authorize",
+                json={
+                    "Properties": {"SandboxId": "RETAIL", "UserTokens": [user_token]},
+                    "RelyingParty": rp,
+                    "TokenType": "JWT",
+                },
+                headers={"Content-Type": "application/json", "x-xbl-contract-version": "1"},
+            )
+            if resp.status_code != 200:
+                raise RuntimeError(f"XSTS failed ({resp.status_code}) RP={rp}: {resp.text[:300]}")
+            return resp.json()
+
+        if client:
+            return _do(client)
+        with httpx.Client(timeout=30) as c:
+            return _do(c)
 
     def _localhost_callback(self) -> str:
         code = None
