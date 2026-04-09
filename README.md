@@ -79,7 +79,7 @@ The user sees a short code and a URL (`microsoft.com/link`), signs in on any dev
 from xbox_client import XboxAuth
 
 # Start — get the code to show the user
-state = XboxAuth.start_device_code()
+state = XboxAuth.start_device_code(client_id="your-client-id")
 print(f"Go to {state.verification_uri} and enter: {state.user_code}")
 
 # Blocking wait (polls automatically)
@@ -95,7 +95,7 @@ Or poll manually for non-blocking usage:
 ```python
 import time
 
-state = XboxAuth.start_device_code()
+state = XboxAuth.start_device_code(client_id="your-client-id")
 # Show state.user_code + state.verification_uri to user
 
 while True:
@@ -246,7 +246,7 @@ RELYING_PARTY = "rp://api.minecraftservices.com/"
 
 @app.post("/xbox/device/start")
 def device_start():
-    state = XboxAuth.start_device_code()
+    state = XboxAuth.start_device_code(client_id="your-client-id")
     sid = str(uuid.uuid4())
     sessions[sid] = {
         "device_code": state.device_code,
@@ -279,18 +279,38 @@ def device_poll():
 
 ## Configuration
 
+All config parameters are keyword-only (after `*`) with sensible defaults. Pass only what you need to override — unspecified values use the built-in defaults.
+
 ```python
 XboxAuth.start_auth(
-    method=AuthMethod.STANDARD,     # or AuthMethod.SISU
-    redirect_uri="https://...",     # custom callback URL (Standard only)
-    client_id="...",                # override Azure AD client ID (Standard only)
-    port=8080,                      # localhost port if no redirect_uri (Standard only)
+    method=AuthMethod.STANDARD,         # or AuthMethod.SISU
+    redirect_uri="https://...",         # custom callback URL (Standard only)
+    port=8080,                          # localhost port if no redirect_uri (Standard only)
+    *,
+    client_id="...",                    # Azure AD client ID
+    scopes="...",                       # OAuth scopes
+    sisu_app_id="...",                  # Sisu/XAL application ID
+    sisu_redirect_uri="...",            # Sisu redirect URI
+    title_id="...",                     # Xbox title ID (Sisu only)
+    device_type="Win32",                # Device type for device token (Sisu only)
+    device_version="10.0",              # OS version for device token (Sisu only)
+    sandbox="RETAIL",                   # Xbox sandbox ID
+    sisu_display="android_phone",       # Display mode for Sisu auth
+    sisu_scope="...",                   # OAuth scope for Sisu flow
 )
 
 XboxAuth.authenticate_interactive(
     method=AuthMethod.STANDARD,
     port=8080,
-    token_file=Path("tokens.json"),  # None to disable caching
+    *,
+    client_id="...",                    # same config kwargs as start_auth
+    token_file=Path("tokens.json"),     # None to disable caching
+)
+
+XboxAuth.start_device_code(
+    client_id="...",                    # required — must be a public client with device code enabled
+    *,
+    scopes="...",                       # OAuth scopes (optional override)
 )
 ```
 
@@ -300,15 +320,15 @@ XboxAuth.authenticate_interactive(
 
 | Method | Description |
 |--------|-------------|
-| `start_auth(method, redirect_uri, client_id, port)` | Stage 1: returns `AuthStartResult` with the auth URL |
-| `finish_auth(code, auth_start)` | Stage 2: returns `XboxAuthSession` |
-| `refresh(refresh_token, method, client_id, port)` | Refresh without user interaction, returns `XboxAuthSession` |
-| `authenticate_interactive(method, port, token_file)` | Convenience: full auth with browser, returns `XboxAuthSession` |
-| `start_device_code(client_id)` | Start device code flow, returns `DeviceCodeState` |
-| `poll_device_code(device_code, client_id)` | Single non-blocking poll, returns status dict with `XboxAuthSession` on success |
-| `await_device_code(device_code, client_id, expires_in, interval)` | Blocking poll until approved, returns `XboxAuthSession` |
-| `get_xbl3_header(session, relying_party)` | Returns `XBL3.0 x=<uhs>;<token>` header string |
-| `get_xsts_token(session, relying_party)` | Returns raw XSTS response dict |
+| `start_auth(method, redirect_uri, port, *, client_id, scopes, ...)` | Stage 1: returns `AuthStartResult` with the auth URL |
+| `finish_auth(code, auth_start)` | Stage 2: returns `XboxAuthSession` (config read from `auth_start`) |
+| `refresh(refresh_token, method, port, *, client_id, scopes, ...)` | Refresh without user interaction, returns `XboxAuthSession` |
+| `authenticate_interactive(method, port, *, client_id, ..., token_file)` | Convenience: full auth with browser, returns `XboxAuthSession` |
+| `start_device_code(client_id, *, scopes)` | Start device code flow, returns `DeviceCodeState` |
+| `poll_device_code(device_code, client_id, *, sandbox)` | Single non-blocking poll, returns status dict with `XboxAuthSession` on success |
+| `await_device_code(device_code, client_id, expires_in, interval, *, sandbox)` | Blocking poll until approved, returns `XboxAuthSession` |
+| `get_xbl3_header(session, relying_party, *, sandbox)` | Returns `XBL3.0 x=<uhs>;<token>` header string |
+| `get_xsts_token(session, relying_party, *, sandbox)` | Returns raw XSTS response dict |
 
 ### `XboxAuthSession`
 
