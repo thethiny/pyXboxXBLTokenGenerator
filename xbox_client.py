@@ -93,6 +93,70 @@ class XboxAuthSession:
 
 
 # ============================================================
+# Internal config (never exposed to the user)
+# ============================================================
+
+@dataclass(frozen=True)
+class _XboxClientConfig:
+    client_id: str = "388ea51c-0b25-4029-aae2-17df49d23905" # Xbox Live Client ID
+    scopes: str = "Xboxlive.signin Xboxlive.offline_access" # Xbox Live API scopes
+    sisu_app_id: str = "000000004c20a908" # Minecraft
+    sisu_redirect_uri: Optional[str] = None  # defaults to ms-xal-{sisu_app_id}://auth
+    title_id: str = "1730755212" # Minecraft
+    device_type: str = "Android"
+    device_version: str = "15.0"
+    sandbox: str = "RETAIL"
+    sisu_display: str = "android_phone"
+    sisu_scope: str = "service::user.auth.xboxlive.com::MBI_SSL" # Xbox Live API scope
+
+    @property
+    def effective_sisu_redirect(self) -> str:
+        return self.sisu_redirect_uri or f"ms-xal-{self.sisu_app_id}://auth"
+
+    def to_dict(self) -> dict:
+        return {
+            "client_id": self.client_id,
+            "scopes": self.scopes,
+            "sisu_app_id": self.sisu_app_id,
+            "sisu_redirect_uri": self.sisu_redirect_uri,
+            "title_id": self.title_id,
+            "device_type": self.device_type,
+            "device_version": self.device_version,
+            "sandbox": self.sandbox,
+            "sisu_display": self.sisu_display,
+            "sisu_scope": self.sisu_scope,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "_XboxClientConfig":
+        return cls(**{k: v for k, v in data.items() if v is not None})
+
+    @classmethod
+    def build(
+        cls,
+        *,
+        client_id: Optional[str] = None,
+        scopes: Optional[str] = None,
+        sisu_app_id: Optional[str] = None,
+        sisu_redirect_uri: Optional[str] = None,
+        title_id: Optional[str] = None,
+        device_type: Optional[str] = None,
+        device_version: Optional[str] = None,
+        sandbox: Optional[str] = None,
+        sisu_display: Optional[str] = None,
+        sisu_scope: Optional[str] = None,
+    ) -> "_XboxClientConfig":
+        kwargs = {k: v for k, v in {
+            "client_id": client_id, "scopes": scopes,
+            "sisu_app_id": sisu_app_id, "sisu_redirect_uri": sisu_redirect_uri,
+            "title_id": title_id, "device_type": device_type,
+            "device_version": device_version, "sandbox": sandbox,
+            "sisu_display": sisu_display, "sisu_scope": sisu_scope,
+        }.items() if v is not None}
+        return cls(**kwargs)
+
+
+# ============================================================
 # ProofKey (EC P-256 Sisu Signing)
 # ============================================================
 
@@ -140,11 +204,6 @@ class XboxAuth:
     Auth state is passed in/out via AuthStartResult and XboxAuthSession.
     """
 
-    _STD_CLIENT_ID = "388ea51c-0b25-4029-aae2-17df49d23905"
-    _STD_SCOPES = "Xboxlive.signin Xboxlive.offline_access"
-    _SISU_APP_ID = "000000004c20a908"
-    _SISU_REDIRECT = f"ms-xal-{_SISU_APP_ID}://auth"
-
     # ============================================================
     # Multi-stage API
     # ============================================================
@@ -154,8 +213,18 @@ class XboxAuth:
         cls,
         method: AuthMethod = AuthMethod.STANDARD,
         redirect_uri: Optional[str] = None,
-        client_id: Optional[str] = None,
         port: int = 8080,
+        *,
+        client_id: Optional[str] = None,
+        scopes: Optional[str] = None,
+        sisu_app_id: Optional[str] = None,
+        sisu_redirect_uri: Optional[str] = None,
+        title_id: Optional[str] = None,
+        device_type: Optional[str] = None,
+        device_version: Optional[str] = None,
+        sandbox: Optional[str] = None,
+        sisu_display: Optional[str] = None,
+        sisu_scope: Optional[str] = None,
     ) -> AuthStartResult:
         """
         Stage 1: Start auth. Returns AuthStartResult with the URL to send the user to.
@@ -163,13 +232,28 @@ class XboxAuth:
         Args:
             method: STANDARD (localhost/custom callback) or SISU (paste-URL)
             redirect_uri: Custom callback URL (Standard only). Defaults to localhost:{port}.
-            client_id: Override Azure AD client ID (Standard only).
             port: Localhost port if redirect_uri not specified (Standard only).
+            client_id: Azure AD client ID (Standard) or override default.
+            scopes: OAuth scopes (Standard only).
+            sisu_app_id: Sisu/XAL application ID.
+            sisu_redirect_uri: Sisu redirect URI. Defaults to ms-xal-{sisu_app_id}://auth.
+            title_id: Xbox title ID for Sisu auth.
+            device_type: Device type for device token (e.g. "Android", "Win32").
+            device_version: OS version for device token.
+            sandbox: Xbox sandbox ID (e.g. "RETAIL").
+            sisu_display: Display mode for Sisu auth query.
+            sisu_scope: OAuth scope for Sisu flow.
         """
+        config = _XboxClientConfig.build(
+            client_id=client_id, scopes=scopes, sisu_app_id=sisu_app_id,
+            sisu_redirect_uri=sisu_redirect_uri, title_id=title_id,
+            device_type=device_type, device_version=device_version,
+            sandbox=sandbox, sisu_display=sisu_display, sisu_scope=sisu_scope,
+        )
         if method == AuthMethod.STANDARD:
-            return cls._start_standard(redirect_uri, client_id, port)
+            return cls._start_standard(redirect_uri, port, config)
         else:
-            return cls._start_sisu()
+            return cls._start_sisu(config)
 
     @classmethod
     def finish_auth(cls, authorization_code: str, auth_start: AuthStartResult) -> XboxAuthSession:
@@ -183,32 +267,49 @@ class XboxAuth:
             return cls._finish_sisu(authorization_code, auth_start)
 
     @classmethod
-    def refresh(cls, refresh_token: str, method: AuthMethod = AuthMethod.STANDARD,
-                client_id: Optional[str] = None, port: int = 8080) -> XboxAuthSession:
+    def refresh(
+        cls,
+        refresh_token: str,
+        method: AuthMethod = AuthMethod.STANDARD,
+        port: int = 8080,
+        *,
+        client_id: Optional[str] = None,
+        scopes: Optional[str] = None,
+        sisu_app_id: Optional[str] = None,
+        device_type: Optional[str] = None,
+        device_version: Optional[str] = None,
+        sandbox: Optional[str] = None,
+        sisu_scope: Optional[str] = None,
+    ) -> XboxAuthSession:
         """
         Refresh auth using a stored refresh token. No user interaction.
         Returns a new XboxAuthSession (with a new refresh_token — save it).
         """
+        config = _XboxClientConfig.build(
+            client_id=client_id, scopes=scopes, sisu_app_id=sisu_app_id,
+            device_type=device_type, device_version=device_version,
+            sandbox=sandbox, sisu_scope=sisu_scope,
+        )
         if method == AuthMethod.STANDARD:
-            return cls._refresh_standard(refresh_token, client_id, port)
+            return cls._refresh_standard(refresh_token, port, config)
         else:
-            return cls._refresh_sisu(refresh_token)
+            return cls._refresh_sisu(refresh_token, config)
 
     # ============================================================
     # Token retrieval
     # ============================================================
 
     @classmethod
-    def get_xbl3_header(cls, session: XboxAuthSession, relying_party: str) -> str:
+    def get_xbl3_header(cls, session: XboxAuthSession, relying_party: str, *, sandbox: Optional[str] = None) -> str:
         """Get XBL3.0 authorization header for the given relying party."""
-        xsts = cls._request_xsts(relying_party, session.user_token)
+        xsts = cls._request_xsts(relying_party, session.user_token, sandbox=sandbox or _XboxClientConfig().sandbox)
         uhs = xsts["DisplayClaims"]["xui"][0]["uhs"]
         return f"XBL3.0 x={uhs};{xsts['Token']}"
 
     @classmethod
-    def get_xsts_token(cls, session: XboxAuthSession, relying_party: str) -> dict:
+    def get_xsts_token(cls, session: XboxAuthSession, relying_party: str, *, sandbox: Optional[str] = None) -> dict:
         """Get raw XSTS response dict for the given relying party."""
-        return cls._request_xsts(relying_party, session.user_token)
+        return cls._request_xsts(relying_party, session.user_token, sandbox=sandbox or _XboxClientConfig().sandbox)
 
     # ============================================================
     # Interactive helper
@@ -218,28 +319,45 @@ class XboxAuth:
     def authenticate_interactive(
         cls,
         method: AuthMethod = AuthMethod.STANDARD,
-        client_id: Optional[str] = None,
         port: int = 8080,
+        *,
+        client_id: Optional[str] = None,
+        scopes: Optional[str] = None,
+        sisu_app_id: Optional[str] = None,
+        sisu_redirect_uri: Optional[str] = None,
+        title_id: Optional[str] = None,
+        device_type: Optional[str] = None,
+        device_version: Optional[str] = None,
+        sandbox: Optional[str] = None,
+        sisu_display: Optional[str] = None,
+        sisu_scope: Optional[str] = None,
         token_file: Optional[Path] = None,
     ) -> XboxAuthSession:
         """
         Convenience: full auth with browser + auto callback (Standard)
         or browser + paste-URL (Sisu). Handles token caching if token_file is set.
         """
+        config_kwargs = dict(
+            client_id=client_id, scopes=scopes, sisu_app_id=sisu_app_id,
+            sisu_redirect_uri=sisu_redirect_uri, title_id=title_id,
+            device_type=device_type, device_version=device_version,
+            sandbox=sandbox, sisu_display=sisu_display, sisu_scope=sisu_scope,
+        )
+
         # Try cached refresh first
         if token_file and token_file.exists():
             try:
                 saved = json.loads(token_file.read_text())
                 rt = saved.get("refresh_token") or saved.get("sisu_refresh_token")
                 if rt:
-                    session = cls.refresh(rt, method=method, client_id=client_id, port=port)
+                    session = cls.refresh(rt, method=method, port=port, **config_kwargs)
                     cls._save_tokens(token_file, session)
                     print(f"[+] Refreshed session for {session.gamertag}")
                     return session
             except Exception:
                 print("[*] Cached tokens expired, logging in...")
 
-        auth_start = cls.start_auth(method=method, client_id=client_id, port=port)
+        auth_start = cls.start_auth(method=method, port=port, **config_kwargs)
 
         print("[*] Opening browser for login...")
         webbrowser.open(auth_start.auth_url)
@@ -267,15 +385,14 @@ class XboxAuth:
     # ============================================================
 
     @classmethod
-    def _start_standard(cls, redirect_uri: Optional[str], client_id: Optional[str], port: int) -> AuthStartResult:
-        cid = client_id or cls._STD_CLIENT_ID
+    def _start_standard(cls, redirect_uri: Optional[str], port: int, config: _XboxClientConfig) -> AuthStartResult:
         redir = redirect_uri or f"http://localhost:{port}/auth/callback"
         state = secrets.token_urlsafe(32)
         params = {
-            "client_id": cid,
+            "client_id": config.client_id,
             "response_type": "code",
             "redirect_uri": redir,
-            "scope": cls._STD_SCOPES,
+            "scope": config.scopes,
             "state": state,
         }
         auth_url = f"https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize?{urlencode(params)}"
@@ -284,22 +401,22 @@ class XboxAuth:
             state=state,
             redirect_uri=redir,
             method=AuthMethod.STANDARD,
-            _internal={"redirect_uri": redir, "client_id": cid},
+            _internal={"config": config.to_dict(), "redirect_uri": redir},
         )
 
     @classmethod
     def _finish_standard(cls, code: str, auth_start: AuthStartResult) -> XboxAuthSession:
+        config = _XboxClientConfig.from_dict(auth_start._internal["config"])
         redir = auth_start._internal["redirect_uri"]
-        cid = auth_start._internal["client_id"]
         with httpx.Client(timeout=30) as client:
             resp = client.post(
                 "https://login.microsoftonline.com/consumers/oauth2/v2.0/token",
                 data={
-                    "client_id": cid,
+                    "client_id": config.client_id,
                     "code": code,
                     "grant_type": "authorization_code",
                     "redirect_uri": redir,
-                    "scope": cls._STD_SCOPES,
+                    "scope": config.scopes,
                 },
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
             )
@@ -307,21 +424,20 @@ class XboxAuth:
             oauth = resp.json()
             return cls._build_session_from_access_token(
                 client, oauth["access_token"], "d",
-                oauth.get("refresh_token"), AuthMethod.STANDARD,
+                oauth.get("refresh_token"), AuthMethod.STANDARD, config,
             )
 
     @classmethod
-    def _refresh_standard(cls, refresh_token: str, client_id: Optional[str], port: int) -> XboxAuthSession:
-        cid = client_id or cls._STD_CLIENT_ID
+    def _refresh_standard(cls, refresh_token: str, port: int, config: _XboxClientConfig) -> XboxAuthSession:
         redir = f"http://localhost:{port}/auth/callback"
         with httpx.Client(timeout=30) as client:
             resp = client.post(
                 "https://login.microsoftonline.com/consumers/oauth2/v2.0/token",
                 data={
-                    "client_id": cid,
+                    "client_id": config.client_id,
                     "grant_type": "refresh_token",
                     "refresh_token": refresh_token,
-                    "scope": cls._STD_SCOPES,
+                    "scope": config.scopes,
                     "redirect_uri": redir,
                 },
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
@@ -330,7 +446,7 @@ class XboxAuth:
             oauth = resp.json()
             return cls._build_session_from_access_token(
                 client, oauth["access_token"], "d",
-                oauth.get("refresh_token", refresh_token), AuthMethod.STANDARD,
+                oauth.get("refresh_token", refresh_token), AuthMethod.STANDARD, config,
             )
 
     # ============================================================
@@ -338,7 +454,7 @@ class XboxAuth:
     # ============================================================
 
     @classmethod
-    def _start_sisu(cls) -> AuthStartResult:
+    def _start_sisu(cls, config: _XboxClientConfig) -> AuthStartResult:
         proof_key = _ProofKey()
         code_verifier = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode()
         code_challenge = base64.urlsafe_b64encode(
@@ -347,17 +463,17 @@ class XboxAuth:
         state = base64.urlsafe_b64encode(secrets.token_bytes(64)).rstrip(b"=").decode()
 
         with httpx.Client(timeout=30) as client:
-            device_token = cls._get_device_token(client, proof_key)
+            device_token = cls._get_device_token(client, proof_key, config)
             url = "https://sisu.xboxlive.com/authenticate"
             body = json.dumps({
-                "AppId": cls._SISU_APP_ID,
-                "TitleId": "1730755212",
-                "RedirectUri": cls._SISU_REDIRECT,
+                "AppId": config.sisu_app_id,
+                "TitleId": config.title_id,
+                "RedirectUri": config.effective_sisu_redirect,
                 "DeviceToken": device_token,
-                "Sandbox": "RETAIL", "TokenType": "code",
-                "Offers": ["service::user.auth.xboxlive.com::MBI_SSL"],
+                "Sandbox": config.sandbox, "TokenType": "code",
+                "Offers": [config.sisu_scope],
                 "Query": {
-                    "display": "android_phone",
+                    "display": config.sisu_display,
                     "code_challenge": code_challenge,
                     "code_challenge_method": "S256",
                     "state": state,
@@ -380,9 +496,10 @@ class XboxAuth:
         return AuthStartResult(
             auth_url=redirect_url,
             state=state,
-            redirect_uri=cls._SISU_REDIRECT,
+            redirect_uri=config.effective_sisu_redirect,
             method=AuthMethod.SISU,
             _internal={
+                "config": config.to_dict(),
                 "code_verifier": code_verifier,
                 "device_token": device_token,
                 "session_id": session_id,
@@ -393,16 +510,17 @@ class XboxAuth:
     @classmethod
     def _finish_sisu(cls, code: str, auth_start: AuthStartResult) -> XboxAuthSession:
         internal = auth_start._internal
+        config = _XboxClientConfig.from_dict(internal["config"])
         proof_key = cls._restore_proof_key(internal["proof_key"])
 
         with httpx.Client(timeout=30) as client:
             resp = client.post("https://login.live.com/oauth20_token.srf", data={
-                "client_id": cls._SISU_APP_ID,
+                "client_id": config.sisu_app_id,
                 "code": code,
                 "code_verifier": internal["code_verifier"],
                 "grant_type": "authorization_code",
-                "redirect_uri": cls._SISU_REDIRECT,
-                "scope": "service::user.auth.xboxlive.com::MBI_SSL",
+                "redirect_uri": config.effective_sisu_redirect,
+                "scope": config.sisu_scope,
             }, headers={"Content-Type": "application/x-www-form-urlencoded"})
             resp.raise_for_status()
             tokens = resp.json()
@@ -411,7 +529,7 @@ class XboxAuth:
 
             sisu = cls._sisu_authorize(
                 client, proof_key, msa_token,
-                internal["device_token"], internal.get("session_id"),
+                internal["device_token"], config, internal.get("session_id"),
             )
             user_token = sisu["UserToken"]["Token"]
             claims = sisu["AuthorizationToken"]["DisplayClaims"]["xui"][0]
@@ -424,22 +542,22 @@ class XboxAuth:
             )
 
     @classmethod
-    def _refresh_sisu(cls, refresh_token: str) -> XboxAuthSession:
+    def _refresh_sisu(cls, refresh_token: str, config: _XboxClientConfig) -> XboxAuthSession:
         proof_key = _ProofKey()
         with httpx.Client(timeout=30) as client:
             resp = client.post("https://login.live.com/oauth20_token.srf", data={
-                "client_id": cls._SISU_APP_ID,
+                "client_id": config.sisu_app_id,
                 "grant_type": "refresh_token",
                 "refresh_token": refresh_token,
-                "scope": "service::user.auth.xboxlive.com::MBI_SSL",
+                "scope": config.sisu_scope,
             }, headers={"Content-Type": "application/x-www-form-urlencoded"})
             resp.raise_for_status()
             tokens = resp.json()
             new_rt: str = tokens.get("refresh_token", refresh_token)
             msa_token = tokens["access_token"]
 
-            device_token = cls._get_device_token(client, proof_key)
-            sisu = cls._sisu_authorize(client, proof_key, msa_token, device_token)
+            device_token = cls._get_device_token(client, proof_key, config)
+            sisu = cls._sisu_authorize(client, proof_key, msa_token, device_token, config)
             user_token = sisu["UserToken"]["Token"]
             claims = sisu["AuthorizationToken"]["DisplayClaims"]["xui"][0]
             return XboxAuthSession(
@@ -458,8 +576,10 @@ class XboxAuth:
     def _build_session_from_access_token(
         cls, client: httpx.Client, access_token: str, prefix: str,
         refresh_token: Optional[str], method: AuthMethod,
+        config: Optional[_XboxClientConfig] = None,
     ) -> XboxAuthSession:
         """Exchange an MSA/Azure AD access token for an Xbox user token + profile info."""
+        cfg = config or _XboxClientConfig()
         resp = client.post(
             "https://user.auth.xboxlive.com/user/authenticate",
             json={
@@ -478,7 +598,7 @@ class XboxAuth:
         user_token: str = resp.json()["Token"]
 
         # Get profile info via default XSTS
-        xsts = cls._request_xsts("http://xboxlive.com", user_token, client=client)
+        xsts = cls._request_xsts("http://xboxlive.com", user_token, sandbox=cfg.sandbox, client=client)
         claims = xsts["DisplayClaims"]["xui"][0]
 
         return XboxAuthSession(
@@ -490,14 +610,16 @@ class XboxAuth:
         )
 
     @classmethod
-    def _get_device_token(cls, client: httpx.Client, proof_key: _ProofKey) -> str:
+    def _get_device_token(cls, client: httpx.Client, proof_key: _ProofKey,
+                          config: Optional[_XboxClientConfig] = None) -> str:
+        cfg = config or _XboxClientConfig()
         url = "https://device.auth.xboxlive.com/device/authenticate"
         device_id = "{" + str(uuid.uuid4()) + "}"
         body = json.dumps({
             "Properties": {
                 "AuthMethod": "ProofOfPossession", "Id": device_id,
-                "DeviceType": "Android", "SerialNumber": device_id,
-                "Version": "15.0", "ProofKey": proof_key.get_jwk(),
+                "DeviceType": cfg.device_type, "SerialNumber": device_id,
+                "Version": cfg.device_version, "ProofKey": proof_key.get_jwk(),
             },
             "RelyingParty": "http://auth.xboxlive.com", "TokenType": "JWT",
         })
@@ -508,12 +630,14 @@ class XboxAuth:
     @classmethod
     def _sisu_authorize(
         cls, client: httpx.Client, proof_key: _ProofKey, msa_token: str,
-        device_token: str, session_id: Optional[str] = None,
+        device_token: str, config: Optional[_XboxClientConfig] = None,
+        session_id: Optional[str] = None,
     ) -> dict:
+        cfg = config or _XboxClientConfig()
         url = "https://sisu.xboxlive.com/authorize"
         body = json.dumps({
-            "AccessToken": f"t={msa_token}", "AppId": cls._SISU_APP_ID,
-            "DeviceToken": device_token, "Sandbox": "RETAIL",
+            "AccessToken": f"t={msa_token}", "AppId": cfg.sisu_app_id,
+            "DeviceToken": device_token, "Sandbox": cfg.sandbox,
             "SiteName": "user.auth.xboxlive.com",
             "UseModernGamertag": True, "ProofKey": proof_key.get_jwk(),
             **({"SessionId": session_id} if session_id else {}),
@@ -535,12 +659,13 @@ class XboxAuth:
         return pk
 
     @classmethod
-    def _request_xsts(cls, rp: str, user_token: str, client: Optional[httpx.Client] = None) -> dict:
+    def _request_xsts(cls, rp: str, user_token: str, sandbox: str = "RETAIL",
+                      client: Optional[httpx.Client] = None) -> dict:
         def _do(c: httpx.Client) -> dict:
             resp = c.post(
                 "https://xsts.auth.xboxlive.com/xsts/authorize",
                 json={
-                    "Properties": {"SandboxId": "RETAIL", "UserTokens": [user_token]},
+                    "Properties": {"SandboxId": sandbox, "UserTokens": [user_token]},
                     "RelyingParty": rp,
                     "TokenType": "JWT",
                 },
