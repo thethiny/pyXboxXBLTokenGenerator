@@ -4,6 +4,8 @@ A lightweight, stateless Python client for Xbox Live authentication. Generates X
 
 Built on `httpx` and `cryptography` only. All methods are stateless class methods — no instance state, safe for concurrent multi-user backends.
 
+In order to create your own Microsoft App to enable your own auth flow, please refer to [this documentation](/make_your_own_client.md) for steps.
+
 ## Features
 
 - **Stateless**: All auth state flows in/out via serializable dataclasses — safe for multi-user backends
