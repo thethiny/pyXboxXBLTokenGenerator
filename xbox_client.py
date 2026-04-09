@@ -62,6 +62,18 @@ class AuthStartResult:
 
 
 @dataclass
+class DeviceCodeState:
+    """Returned by start_device_code(). Contains everything needed to display to user and poll."""
+    device_code: str
+    user_code: str
+    verification_uri: str
+    expires_in: int
+    interval: int
+    message: str
+    client_id: str
+
+
+@dataclass
 class XboxAuthSession:
     """Authenticated session. Pass to get_xbl3_header() / get_xsts_token()."""
     user_token: str
@@ -204,6 +216,10 @@ class XboxAuth:
     Auth state is passed in/out via AuthStartResult and XboxAuthSession.
     """
 
+    _DEVICE_CODE_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:device_code"
+    _DEVICE_CODE_URL = "https://login.microsoftonline.com/consumers/oauth2/v2.0/devicecode"
+    _DEVICE_CODE_TOKEN_URL = "https://login.microsoftonline.com/consumers/oauth2/v2.0/token"
+
     # ============================================================
     # Multi-stage API
     # ============================================================
@@ -294,6 +310,133 @@ class XboxAuth:
             return cls._refresh_standard(refresh_token, port, config)
         else:
             return cls._refresh_sisu(refresh_token, config)
+
+    # ============================================================
+    # Device Code Flow (RFC 8628)
+    # ============================================================
+
+    @classmethod
+    def start_device_code(
+        cls,
+        client_id: str,
+        *,
+        scopes: Optional[str] = None,
+    ) -> DeviceCodeState:
+        """
+        Request a new device code from Microsoft.
+        The user visits verification_uri and types user_code to sign in.
+
+        Args:
+            client_id: Azure AD client ID. Must be a public client with device code enabled.
+            scopes: OAuth scopes. Defaults to "Xboxlive.signin Xboxlive.offline_access".
+        """
+        config = _XboxClientConfig.build(scopes=scopes)
+        resp = httpx.post(
+            cls._DEVICE_CODE_URL,
+            data={"client_id": client_id, "scope": config.scopes},
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return DeviceCodeState(
+            device_code=data["device_code"],
+            user_code=data["user_code"],
+            verification_uri=data["verification_uri"],
+            expires_in=data["expires_in"],
+            interval=data["interval"],
+            message=data["message"],
+            client_id=client_id,
+        )
+
+    @classmethod
+    def poll_device_code(
+        cls,
+        device_code: str,
+        client_id: str,
+        *,
+        sandbox: Optional[str] = None,
+    ) -> dict:
+        """
+        Single non-blocking poll for device code approval.
+
+        Args:
+            device_code: from start_device_code()
+            client_id: must match the one used in start_device_code()
+            sandbox: Xbox sandbox ID for XSTS token request.
+
+        Returns:
+            {"status": "ok", "session": XboxAuthSession}
+            {"status": "pending"}
+            {"status": "pending", "slow_down": True}
+            {"status": "error", "error": "..."}
+        """
+        config = _XboxClientConfig.build(sandbox=sandbox)
+        resp = httpx.post(
+            cls._DEVICE_CODE_TOKEN_URL,
+            data={
+                "grant_type": cls._DEVICE_CODE_GRANT_TYPE,
+                "client_id": client_id,
+                "device_code": device_code,
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        data = resp.json()
+
+        if "access_token" in data:
+            try:
+                with httpx.Client(timeout=30) as client:
+                    session = cls._build_session_from_access_token(
+                        client, data["access_token"], "d",
+                        data.get("refresh_token"), AuthMethod.STANDARD, config,
+                    )
+                return {"status": "ok", "session": session}
+            except Exception as e:
+                return {"status": "error", "error": f"Xbox token exchange failed: {e}"}
+
+        error = data.get("error", "")
+        description = data.get("error_description", "")
+        if error == "authorization_pending":
+            return {"status": "pending"}
+        elif error == "slow_down":
+            return {"status": "pending", "slow_down": True}
+        elif error == "authorization_declined":
+            return {"status": "error", "error": "User declined the sign-in request."}
+        elif error == "expired_token":
+            return {"status": "error", "error": "Device code expired. Please try again."}
+        else:
+            return {"status": "error", "error": f"{error}: {description}"}
+
+    @classmethod
+    def await_device_code(
+        cls,
+        device_code: str,
+        client_id: str,
+        expires_in: int = 900,
+        interval: int = 5,
+        *,
+        sandbox: Optional[str] = None,
+    ) -> XboxAuthSession:
+        """
+        Blocking helper: polls until user approves or code expires.
+
+        Args:
+            device_code: from start_device_code()
+            client_id: must match the one used in start_device_code()
+            expires_in: seconds until expiry (from start_device_code())
+            interval: seconds between polls (from start_device_code())
+            sandbox: Xbox sandbox ID for XSTS token request.
+        """
+        deadline = time.time() + expires_in
+        while time.time() < deadline:
+            result = cls.poll_device_code(device_code, client_id, sandbox=sandbox)
+            if result["status"] == "ok":
+                return result["session"]
+            elif result.get("slow_down"):
+                interval += 5
+            elif result["status"] == "error":
+                raise RuntimeError(result["error"])
+            time.sleep(interval)
+        raise RuntimeError("Device code expired before user approved.")
 
     # ============================================================
     # Token retrieval

@@ -11,7 +11,7 @@ In order to create your own Microsoft App to enable your own auth flow, please r
 - **Stateless**: All auth state flows in/out via serializable dataclasses — safe for multi-user backends
 - **Multi-stage API**: Decoupled from browser/UI — integrate into Flask, FastAPI, or any backend
 - **Interactive helper**: One-line auth with browser + auto-capture for CLI tools
-- **Two auth methods**: Standard OAuth (localhost callback) and Sisu/XAL (Xbox Android app flow)
+- **Three auth methods**: Standard OAuth (localhost callback), Sisu/XAL (Xbox Android app flow), and Device Code (RFC 8628 — code on screen, sign in from any device)
 - **Token refresh**: Reuse refresh tokens across sessions without re-login
 - **Any relying party**: Request XSTS tokens for any Xbox partner service
 - **Serializable sessions**: `XboxAuthSession.to_dict()` / `.from_dict()` for database storage
@@ -69,6 +69,46 @@ Uses the Xbox Android app's Sisu authentication flow with EC P-256 request signi
 from xbox_client import XboxAuth, AuthMethod
 
 session = XboxAuth.authenticate_interactive(method=AuthMethod.SISU)
+```
+
+### Device Code (RFC 8628)
+
+The user sees a short code and a URL (`microsoft.com/link`), signs in on any device (phone, another PC, etc.), and the backend polls for completion. No browser redirect or callback needed — ideal for headless servers, TV apps, and web backends where the user authenticates on a separate device.
+
+```python
+from xbox_client import XboxAuth
+
+# Start — get the code to show the user
+state = XboxAuth.start_device_code()
+print(f"Go to {state.verification_uri} and enter: {state.user_code}")
+
+# Blocking wait (polls automatically)
+session = XboxAuth.await_device_code(
+    state.device_code, state.client_id,
+    state.expires_in, state.interval,
+)
+header = XboxAuth.get_xbl3_header(session, "rp://api.minecraftservices.com/")
+```
+
+Or poll manually for non-blocking usage:
+
+```python
+import time
+
+state = XboxAuth.start_device_code()
+# Show state.user_code + state.verification_uri to user
+
+while True:
+    result = XboxAuth.poll_device_code(state.device_code, state.client_id)
+    if result["status"] == "ok":
+        session = result["session"]
+        break
+    elif result["status"] == "pending":
+        time.sleep(state.interval)
+    else:
+        raise Exception(result["error"])
+
+header = XboxAuth.get_xbl3_header(session, "rp://api.minecraftservices.com/")
 ```
 
 ## Multi-Stage Flow (Backend Integration)
@@ -192,6 +232,51 @@ def refresh_route():
         return redirect("/login")
 ```
 
+### Flask Example (Device Code)
+
+```python
+from flask import Flask, jsonify, request
+from xbox_client import XboxAuth
+import uuid
+
+app = Flask(__name__)
+sessions = {}
+
+RELYING_PARTY = "rp://api.minecraftservices.com/"
+
+@app.post("/xbox/device/start")
+def device_start():
+    state = XboxAuth.start_device_code()
+    sid = str(uuid.uuid4())
+    sessions[sid] = {
+        "device_code": state.device_code,
+        "client_id": state.client_id,
+    }
+    return jsonify(
+        session_id=sid,
+        user_code=state.user_code,
+        verification_uri=state.verification_uri,
+        interval=state.interval,
+        expires_in=state.expires_in,
+    )
+
+@app.post("/xbox/device/poll")
+def device_poll():
+    data = request.get_json()
+    session = sessions.get(data["session_id"])
+    if not session:
+        return jsonify(status="error", error="Invalid session"), 400
+
+    result = XboxAuth.poll_device_code(session["device_code"], session["client_id"])
+
+    if result["status"] == "ok":
+        sessions.pop(data["session_id"], None)
+        header = XboxAuth.get_xbl3_header(result["session"], RELYING_PARTY)
+        return jsonify(status="ok", token=header, gamertag=result["session"].gamertag)
+
+    return jsonify(result)
+```
+
 ## Configuration
 
 ```python
@@ -219,6 +304,9 @@ XboxAuth.authenticate_interactive(
 | `finish_auth(code, auth_start)` | Stage 2: returns `XboxAuthSession` |
 | `refresh(refresh_token, method, client_id, port)` | Refresh without user interaction, returns `XboxAuthSession` |
 | `authenticate_interactive(method, port, token_file)` | Convenience: full auth with browser, returns `XboxAuthSession` |
+| `start_device_code(client_id)` | Start device code flow, returns `DeviceCodeState` |
+| `poll_device_code(device_code, client_id)` | Single non-blocking poll, returns status dict with `XboxAuthSession` on success |
+| `await_device_code(device_code, client_id, expires_in, interval)` | Blocking poll until approved, returns `XboxAuthSession` |
 | `get_xbl3_header(session, relying_party)` | Returns `XBL3.0 x=<uhs>;<token>` header string |
 | `get_xsts_token(session, relying_party)` | Returns raw XSTS response dict |
 
@@ -250,3 +338,17 @@ Returned by `start_auth()`. Pass to `finish_auth()`.
 | `redirect_uri` | `str` | Where the user will be redirected after login |
 | `method` | `AuthMethod` | Which auth method is being used |
 | `_internal` | `dict` | Internal flow state (store in session, pass back to `finish_auth`) |
+
+### `DeviceCodeState`
+
+Returned by `start_device_code()`. Show `user_code` and `verification_uri` to the user, use `device_code` and `client_id` for polling.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `device_code` | `str` | Opaque code for polling (don't show to user) |
+| `user_code` | `str` | Short code for the user to type (e.g. "B6N9D34T") |
+| `verification_uri` | `str` | URL the user visits (`https://www.microsoft.com/link`) |
+| `expires_in` | `int` | Seconds until the code expires |
+| `interval` | `int` | Minimum seconds between poll attempts |
+| `message` | `str` | Human-readable instruction from Microsoft |
+| `client_id` | `str` | Client ID used (pass back to poll/await) |
